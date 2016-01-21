@@ -13,7 +13,6 @@
 struct fio_rbd_iou {
 	struct io_u *io_u;
 	rbd_completion_t completion;
-	int io_seen;
 	int io_complete;
 };
 
@@ -21,8 +20,6 @@ struct rbd_data {
 	rados_t cluster;
 	rados_ioctx_t io_ctx;
 	rbd_image_t image;
-	struct io_u **aio_events;
-	struct io_u **sort_events;
 };
 
 struct rbd_options {
@@ -86,14 +83,6 @@ static int _fio_setup_rbd_data(struct thread_data *td,
 
 	rbd = calloc(1, sizeof(struct rbd_data));
 	if (!rbd)
-		goto failed;
-
-	rbd->aio_events = calloc(td->o.iodepth, sizeof(struct io_u *));
-	if (!rbd->aio_events)
-		goto failed;
-
-	rbd->sort_events = calloc(td->o.iodepth, sizeof(struct io_u *));
-	if (!rbd->sort_events)
 		goto failed;
 
 	*rbd_data_ptr = rbd;
@@ -196,139 +185,11 @@ static void _fio_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 	fri->io_complete = 1;
 }
 
-static struct io_u *fio_rbd_event(struct thread_data *td, int event)
-{
-	struct rbd_data *rbd = td->io_ops->data;
-
-	return rbd->aio_events[event];
-}
-
-static inline int fri_check_complete(struct rbd_data *rbd, struct io_u *io_u,
-				     unsigned int *events)
-{
-	struct fio_rbd_iou *fri = io_u->engine_data;
-
-	if (fri->io_complete) {
-		fri->io_seen = 1;
-		rbd->aio_events[*events] = io_u;
-		(*events)++;
-
-		rbd_aio_release(fri->completion);
-		return 1;
-	}
-
-	return 0;
-}
-
-static inline int rbd_io_u_seen(struct io_u *io_u)
-{
-	struct fio_rbd_iou *fri = io_u->engine_data;
-
-	return fri->io_seen;
-}
-
 static void rbd_io_u_wait_complete(struct io_u *io_u)
 {
 	struct fio_rbd_iou *fri = io_u->engine_data;
 
 	rbd_aio_wait_for_complete(fri->completion);
-}
-
-static int rbd_io_u_cmp(const void *p1, const void *p2)
-{
-	const struct io_u **a = (const struct io_u **) p1;
-	const struct io_u **b = (const struct io_u **) p2;
-	uint64_t at, bt;
-
-	at = utime_since_now(&(*a)->start_time);
-	bt = utime_since_now(&(*b)->start_time);
-
-	if (at < bt)
-		return -1;
-	else if (at == bt)
-		return 0;
-	else
-		return 1;
-}
-
-static int rbd_iter_events(struct thread_data *td, unsigned int *events,
-			   unsigned int min_evts, int wait)
-{
-	struct rbd_data *rbd = td->io_ops->data;
-	unsigned int this_events = 0;
-	struct io_u *io_u;
-	int i, sidx;
-
-	sidx = 0;
-	io_u_qiter(&td->io_u_all, io_u, i) {
-		if (!(io_u->flags & IO_U_F_FLIGHT))
-			continue;
-		if (rbd_io_u_seen(io_u))
-			continue;
-
-		if (fri_check_complete(rbd, io_u, events))
-			this_events++;
-		else if (wait)
-			rbd->sort_events[sidx++] = io_u;
-	}
-
-	if (!wait || !sidx)
-		return this_events;
-
-	/*
-	 * Sort events, oldest issue first, then wait on as many as we
-	 * need in order of age. If we have enough events, stop waiting,
-	 * and just check if any of the older ones are done.
-	 */
-	if (sidx > 1)
-		qsort(rbd->sort_events, sidx, sizeof(struct io_u *), rbd_io_u_cmp);
-
-	for (i = 0; i < sidx; i++) {
-		io_u = rbd->sort_events[i];
-
-		if (fri_check_complete(rbd, io_u, events)) {
-			this_events++;
-			continue;
-		}
-
-		/*
-		 * Stop waiting when we have enough, but continue checking
-		 * all pending IOs if they are complete.
-		 */
-		if (*events >= min_evts)
-			continue;
-
-		rbd_io_u_wait_complete(io_u);
-
-		if (fri_check_complete(rbd, io_u, events))
-			this_events++;
-	}
-
-	return this_events;
-}
-
-static int fio_rbd_getevents(struct thread_data *td, unsigned int min,
-			     unsigned int max, const struct timespec *t)
-{
-	unsigned int this_events, events = 0;
-	struct rbd_options *o = td->eo;
-	int wait = 0;
-
-	do {
-		this_events = rbd_iter_events(td, &events, min, wait);
-
-		if (events >= min)
-			break;
-		if (this_events)
-			continue;
-
-		if (!o->busy_poll)
-			wait = 1;
-		else
-			nop;
-	} while (1);
-
-	return events;
 }
 
 static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
@@ -339,7 +200,6 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 
 	fio_ro_check(td, io_u);
 
-	fri->io_seen = 0;
 	fri->io_complete = 0;
 
 	r = rbd_aio_create_completion(fri, _fio_rbd_finish_aiocb,
@@ -384,7 +244,10 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 		goto failed_comp;
 	}
 
-	return FIO_Q_QUEUED;
+	rbd_io_u_wait_complete(io_u);
+	rbd_aio_release(fri->completion);
+
+	return FIO_Q_COMPLETED;
 failed_comp:
 	rbd_aio_release(fri->completion);
 failed:
@@ -415,8 +278,6 @@ static void fio_rbd_cleanup(struct thread_data *td)
 
 	if (rbd) {
 		_fio_rbd_disconnect(rbd);
-		free(rbd->aio_events);
-		free(rbd->sort_events);
 		free(rbd);
 	}
 }
@@ -532,8 +393,7 @@ static struct ioengine_ops ioengine = {
 	.setup			= fio_rbd_setup,
 	.init			= fio_rbd_init,
 	.queue			= fio_rbd_queue,
-	.getevents		= fio_rbd_getevents,
-	.event			= fio_rbd_event,
+	.flags			= FIO_SYNCIO,
 	.cleanup		= fio_rbd_cleanup,
 	.open_file		= fio_rbd_open,
 	.invalidate		= fio_rbd_invalidate,
