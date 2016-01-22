@@ -12,8 +12,6 @@
 
 struct fio_rbd_iou {
 	struct io_u *io_u;
-	rbd_completion_t completion;
-	int io_complete;
 };
 
 struct rbd_data {
@@ -27,7 +25,6 @@ struct rbd_options {
 	char *rbd_name;
 	char *pool_name;
 	char *client_name;
-	int busy_poll;
 };
 
 static struct fio_option options[] = {
@@ -55,16 +52,6 @@ static struct fio_option options[] = {
 		.type		= FIO_OPT_STR_STORE,
 		.help		= "Name of the ceph client to access the RBD for the RBD engine",
 		.off1		= offsetof(struct rbd_options, client_name),
-		.category	= FIO_OPT_C_ENGINE,
-		.group		= FIO_OPT_G_RBD,
-	},
-	{
-		.name		= "busy_poll",
-		.lname		= "Busy poll",
-		.type		= FIO_OPT_BOOL,
-		.help		= "Busy poll for completions instead of sleeping",
-		.off1		= offsetof(struct rbd_options, busy_poll),
-		.def		= "0",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_RBD,
 	},
@@ -164,92 +151,48 @@ static void _fio_rbd_disconnect(struct rbd_data *rbd)
 	}
 }
 
-static void _fio_rbd_finish_aiocb(rbd_completion_t comp, void *data)
-{
-	struct fio_rbd_iou *fri = data;
-	struct io_u *io_u = fri->io_u;
-	ssize_t ret;
-
-	/*
-	 * Looks like return value is 0 for success, or < 0 for
-	 * a specific error. So we have to assume that it can't do
-	 * partial completions.
-	 */
-	ret = rbd_aio_get_return_value(fri->completion);
-	if (ret < 0) {
-		io_u->error = ret;
-		io_u->resid = io_u->xfer_buflen;
-	} else
-		io_u->error = 0;
-
-	fri->io_complete = 1;
-}
-
-static void rbd_io_u_wait_complete(struct io_u *io_u)
-{
-	struct fio_rbd_iou *fri = io_u->engine_data;
-
-	rbd_aio_wait_for_complete(fri->completion);
-}
-
 static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 {
 	struct rbd_data *rbd = td->io_ops->data;
-	struct fio_rbd_iou *fri = io_u->engine_data;
 	int r = -1;
 
 	fio_ro_check(td, io_u);
 
-	fri->io_complete = 0;
-
-	r = rbd_aio_create_completion(fri, _fio_rbd_finish_aiocb,
-						&fri->completion);
-	if (r < 0) {
-		log_err("rbd_aio_create_completion failed.\n");
-		goto failed;
-	}
-
 	if (io_u->ddir == DDIR_WRITE) {
-		r = rbd_aio_write(rbd->image, io_u->offset, io_u->xfer_buflen,
-					 io_u->xfer_buf, fri->completion);
+		r = rbd_write(rbd->image, io_u->offset, io_u->xfer_buflen,
+			      io_u->xfer_buf);
 		if (r < 0) {
-			log_err("rbd_aio_write failed.\n");
-			goto failed_comp;
+			log_err("rbd_write failed.\n");
+			goto failed_with_resid;
 		}
-
 	} else if (io_u->ddir == DDIR_READ) {
-		r = rbd_aio_read(rbd->image, io_u->offset, io_u->xfer_buflen,
-					io_u->xfer_buf, fri->completion);
-
+		r = rbd_read(rbd->image, io_u->offset, io_u->xfer_buflen,
+			     io_u->xfer_buf);
 		if (r < 0) {
-			log_err("rbd_aio_read failed.\n");
-			goto failed_comp;
+			log_err("rbd_read failed.\n");
+			goto failed_with_resid;
 		}
 	} else if (io_u->ddir == DDIR_TRIM) {
-		r = rbd_aio_discard(rbd->image, io_u->offset,
-					io_u->xfer_buflen, fri->completion);
+		r = rbd_discard(rbd->image, io_u->offset, io_u->xfer_buflen);
 		if (r < 0) {
-			log_err("rbd_aio_discard failed.\n");
-			goto failed_comp;
+			log_err("rbd_discard failed.\n");
+			goto failed_with_resid;
 		}
 	} else if (io_u->ddir == DDIR_SYNC) {
-		r = rbd_aio_flush(rbd->image, fri->completion);
+		r = rbd_flush(rbd->image);
 		if (r < 0) {
 			log_err("rbd_flush failed.\n");
-			goto failed_comp;
+			goto failed;
 		}
 	} else {
 		dprint(FD_IO, "%s: Warning: unhandled ddir: %d\n", __func__,
 		       io_u->ddir);
-		goto failed_comp;
+		goto failed;
 	}
 
-	rbd_io_u_wait_complete(io_u);
-	rbd_aio_release(fri->completion);
-
 	return FIO_Q_COMPLETED;
-failed_comp:
-	rbd_aio_release(fri->completion);
+failed_with_resid:
+	io_u->resid = io_u->xfer_buflen;
 failed:
 	io_u->error = r;
 	td_verror(td, io_u->error, "xfer");
