@@ -112,16 +112,11 @@ static int _fio_rbd_connect(struct thread_data *td)
 		goto failed_shutdown;
 	}
 
-	r = rbd_open(rbd->io_ctx, o->rbd_name, &rbd->image, NULL /*snap */ );
-	if (r < 0) {
-		log_err("rbd_open failed.\n");
-		goto failed_open;
-	}
+	/* XXX image is reopened for each IO */
+	rbd->image = NULL;
+
 	return 0;
 
-failed_open:
-	rados_ioctx_destroy(rbd->io_ctx);
-	rbd->io_ctx = NULL;
 failed_shutdown:
 	rados_shutdown(rbd->cluster);
 	rbd->cluster = NULL;
@@ -135,11 +130,6 @@ static void _fio_rbd_disconnect(struct rbd_data *rbd)
 		return;
 
 	/* shutdown everything */
-	if (rbd->image) {
-		rbd_close(rbd->image);
-		rbd->image = NULL;
-	}
-
 	if (rbd->io_ctx) {
 		rados_ioctx_destroy(rbd->io_ctx);
 		rbd->io_ctx = NULL;
@@ -151,12 +141,36 @@ static void _fio_rbd_disconnect(struct rbd_data *rbd)
 	}
 }
 
+static int _fio_rbd_io_init(struct rbd_data *rbd, struct rbd_options *o)
+{
+	int r = -1;
+
+	r = rbd_open(rbd->io_ctx, o->rbd_name, &rbd->image, NULL /*snap */ );
+
+	return r;
+}
+
+static void _fio_rbd_io_deinit(struct rbd_data *rbd)
+{
+	if (rbd->image) {
+		rbd_close(rbd->image);
+		rbd->image = NULL;
+	}
+}
+
 static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 {
 	struct rbd_data *rbd = td->io_ops->data;
+	struct rbd_options *o = td->eo;
 	int r = -1;
 
 	fio_ro_check(td, io_u);
+
+	r = _fio_rbd_io_init(rbd, o);
+	if (r < 0) {
+		log_err("rbd_open failed.\n");
+		goto failed_open;
+	}
 
 	if (io_u->ddir == DDIR_WRITE) {
 		r = rbd_write(rbd->image, io_u->offset, io_u->xfer_buflen,
@@ -190,10 +204,14 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 		goto failed;
 	}
 
+	_fio_rbd_io_deinit(rbd);
+
 	return FIO_Q_COMPLETED;
 failed_with_resid:
 	io_u->resid = io_u->xfer_buflen;
 failed:
+	_fio_rbd_io_deinit(rbd);
+failed_open:
 	io_u->error = r;
 	td_verror(td, io_u->error, "xfer");
 	return FIO_Q_COMPLETED;
@@ -261,8 +279,14 @@ static int fio_rbd_setup(struct thread_data *td)
 		goto cleanup;
 	}
 
+	r = _fio_rbd_io_init(rbd, td->eo);
+	if (r < 0) {
+		goto disconnect;
+	}
+
 	/* get size of the RADOS block device */
 	r = rbd_stat(rbd->image, &info, sizeof(info));
+	_fio_rbd_io_deinit(rbd);
 	if (r < 0) {
 		log_err("rbd_status failed.\n");
 		goto disconnect;
@@ -302,9 +326,17 @@ static int fio_rbd_open(struct thread_data *td, struct fio_file *f)
 static int fio_rbd_invalidate(struct thread_data *td, struct fio_file *f)
 {
 #if defined(CONFIG_RBD_INVAL)
+	int r;
 	struct rbd_data *rbd = td->io_ops->data;
 
-	return rbd_invalidate_cache(rbd->image);
+	r = _fio_rbd_io_init(rbd, td->eo);
+	if (r < 0) {
+		return r;
+	}
+
+	r = rbd_invalidate_cache(rbd->image);
+	_fio_rbd_io_deinit(rbd);
+	return r;
 #else
 	return 0;
 #endif
